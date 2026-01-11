@@ -1,0 +1,66 @@
+# Webots
+*.wbproj
+*.snapshot.*
+*.backup
+*~
+.DS_Store
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.pyc
+venv/
+env/
+ENV/
+
+# YOLO
+yolov8*.pt
+runs/
+*.weights
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Compiled files
+*.o
+*.so
+*.dll
+
+# Large files (optional - wenn du die Snapshots nicht hochladen willst)
+*.zip
+*.rar
+*.tar.gz
+
+# PDFs (optional)
+*.pdf
