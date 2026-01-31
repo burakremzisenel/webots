@@ -27,6 +27,7 @@ from controller import Keyboard
 import numpy as np
 import cv2
 from ultralytics import YOLO
+import collections  # Moving Average için
 
 from math import cos, sin
 
@@ -210,6 +211,12 @@ if __name__ == '__main__':
     group_aligned = False  # Grup merkezine hizalandık mı?
     max_box_height = 0  # Maksimum box yüksekliği (schrumpfeni tespit için)
 
+    # MOVING AVERAGE FİLTRESİ - Target jumping'i önlemek için
+    MA_X_LEN = 5  # X pozisyonu için 5 örnek
+    MA_Z_LEN = 5  # Mesafe/BoxHeight için 5 örnek
+    ma_x = collections.deque(maxlen=MA_X_LEN)  # X pozisyonu Moving Average
+    ma_box_height = collections.deque(maxlen=MA_Z_LEN)  # Box yüksekliği Moving Average
+
     print("\n")
 
     print("====== Controls =======\n\n")
@@ -367,6 +374,13 @@ if __name__ == '__main__':
                 print(f"=== KIRMIZI HEDEF SEÇİLDİ X={target_info['x']:.0f}, Box={target_info['box']}, Mesafe={range_front_value:.2f}m - YAKLAŞMAYA BAŞLA ===")
                 mission_state = "APPROACH"
                 mission_timer = 0
+                # Moving Average'ı sıfırla ve ilk değeri ekle
+                ma_x.clear()
+                ma_box_height.clear()
+                ma_x.append(target_info['x'])
+                box_h = target_info['box'][3] - target_info['box'][1]
+                ma_box_height.append(box_h)
+                max_box_height = box_h  # Max box'ı da sıfırla
             else:
                 # Kırmızı nesne yok, gruba geri dön
                 if mission_timer > 3.0:
@@ -375,8 +389,34 @@ if __name__ == '__main__':
                     mission_timer = 0
 
         elif mission_state == "APPROACH":
-            # YAKLAŞMA: Kilitli hedefe uç
+            # YAKLAŞMA: Kilitli hedefe uç (MOVING AVERAGE ile)
             if locked_target is not None:
+                # Yeni algılama yap
+                current_target = detect_object(camera_data, camera.getWidth(), camera.getHeight(), yolo_model, mode='select')
+
+                if current_target is not None:
+                    # MOVING AVERAGE: Ham değeri ekle (sıçramalar dahil!)
+                    ma_x.append(current_target['x'])
+                    new_box = current_target['box']
+                    new_box_height = new_box[3] - new_box[1]
+                    ma_box_height.append(new_box_height)
+
+                    # Box'ı güncelle (her zaman en son box kullan)
+                    locked_target['box'] = new_box
+                    locked_target['y'] = current_target['y']
+
+                # MOVING AVERAGE hesapla - YUMUŞATILMIŞ değerler
+                if len(ma_x) > 0:
+                    smoothed_x = sum(ma_x) / len(ma_x)
+                    locked_target['x'] = smoothed_x  # Yumuşatılmış X kullan
+                else:
+                    smoothed_x = locked_target['x']
+
+                if len(ma_box_height) > 0:
+                    smoothed_box_height = sum(ma_box_height) / len(ma_box_height)
+                else:
+                    smoothed_box_height = 20  # Varsayılan
+
                 object_x = locked_target['x']
                 object_y = locked_target['y']
                 target_box = locked_target['box']
@@ -384,90 +424,71 @@ if __name__ == '__main__':
                 center_x = camera.getWidth() / 2
                 center_y = camera.getHeight() / 2
                 error_x = object_x - center_x
-                error_y = object_y - center_y  # Y ekseni hatası (yukarı/aşağı)
+                error_y = object_y - center_y
 
-                # Hedefe dön (Yaw)
+                # Hedefe dön (Yaw) - YUMUŞATILMIŞ X ile
                 yaw_desired = -0.004 * error_x
                 yaw_desired = max(-0.5, min(0.5, yaw_desired))
 
-                # Bounding box boyutunu kullanarak mesafe tahmin et
-                box_height = target_box[3] - target_box[1]  # y2 - y1
-                box_width = target_box[2] - target_box[0]   # x2 - x1
+                # Box yüksekliği - YUMUŞATILMIŞ
+                box_height = smoothed_box_height
 
                 # Maksimum box yüksekliğini takip et
                 if box_height > max_box_height:
                     max_box_height = box_height
 
-                # STOPP LOGIC: Box schrumpft (zumindest 10px kleiner als Maximum)
+                # STOPP LOGIC: Box schrumpft (YUMUŞATILMIŞ değerle)
                 is_shrinking = (max_box_height - box_height) > 10
 
-                # PHASE DETECTION: Box büyüklüğüne göre faz belirle
-                # Phase 1: Box < 35px → Uzak, sadece yatay yaklaş
-                # Phase 2: Box >= 35px → Yakın, Z eksenini de ayarla + sensör kullan
+                # PHASE DETECTION
                 is_close_phase = box_height >= 35
 
                 # --- YÜKSEK SEVİYE KONTROL (Z ekseni) ---
                 if is_close_phase:
-                    # YAKIN FAZ: Target'i Y ekseninde merkezle (yüksekliği ayarla)
-                    # Hedef ekranın alt yarısındaysa → alçal
-                    # Hedef ekranın üst yarısındaysa → yüksel
-                    if abs(error_y) > 20:  # ±20px tolerans
-                        height_diff_desired = -error_y * 0.0002  # Y hatası → yükseklik değişimi
-                        height_diff_desired = max(-0.08, min(0.08, height_diff_desired))  # Sınırla
+                    if abs(error_y) > 20:
+                        height_diff_desired = -error_y * 0.0002
+                        height_diff_desired = max(-0.08, min(0.08, height_diff_desired))
 
-                # --- İLERİ HAREKET (X ekseni) ---
-                if abs(error_x) < 80:  # X ekseninde merkezlenmişse
+                # --- İLERİ HAREKET ---
+                if abs(error_x) < 80:
                     if is_close_phase:
                         # YAKIN FAZ: Distanz sensörü kullan
-                        if range_front_value < 2.0 and range_front_value > 0.1:  # Geçerli okuma
+                        if range_front_value < 2.0 and range_front_value > 0.1:
                             if range_front_value > 0.35:
-                                forward_desired = 0.10  # Yavaş yaklaş
+                                forward_desired = 0.10
                             elif range_front_value > 0.25:
-                                forward_desired = 0.05  # Çok yavaş
+                                forward_desired = 0.05
                             else:
-                                # 25cm'ye ulaştık → DUR
                                 forward_desired = 0
                                 print(f"=== HEDEFE ULAŞILDI! Distanz={range_front_value:.2f}m ===")
                         else:
-                            # Sensör okuması yok, box boyutunu kullan
                             if is_shrinking:
                                 forward_desired = 0
-                                print(f"=== HEDEFE ULAŞILDI! BoxH={box_height}px schrumpft (Max={max_box_height}px) ===")
+                                print(f"=== HEDEFE ULAŞILDI! BoxH={box_height:.0f}px schrumpft (Max={max_box_height:.0f}px) ===")
                             else:
                                 forward_desired = 0.10
                     else:
-                        # UZAK FAZ: Box boyutuna göre uç
+                        # UZAK FAZ
                         if is_shrinking:
                             forward_desired = 0
-                            print(f"=== HEDEFE ULAŞILDI! BoxH={box_height}px schrumpft (Max={max_box_height}px) ===")
+                            print(f"=== HEDEFE ULAŞILDI! BoxH={box_height:.0f}px schrumpft (Max={max_box_height:.0f}px) ===")
                         else:
-                            forward_desired = 0.15  # Normal hız
-
-                # Hedefi güncelle - 20px tolerans
-                current_target = detect_object(camera_data, camera.getWidth(), camera.getHeight(), yolo_model, mode='select')
-                if current_target is not None:
-                    new_x = current_target['x']
-                    new_box = current_target['box']
-                    x_diff = abs(new_x - object_x)
-
-                    # SADECE 20px içindeyse güncelle
-                    if x_diff < 20:
-                        locked_target = {'x': new_x, 'y': current_target['y'], 'box': new_box}
-                    else:
-                        # Büyük sıçrama - YOKSAY
-                        print(f"[UYARI] Target sıçrama yoksayıldı: {object_x:.0f} -> {new_x:.0f} (Fark={x_diff:.0f}px)")
+                            forward_desired = 0.15
 
                 # Her 10. frame'de log
                 if int(mission_timer * 32) % 10 == 0:
                     shrink_status = "SCHRUMPFT!" if is_shrinking else "wächst"
-                    phase = "YAKIN(Z+Sensor)" if is_close_phase else "UZAK(X+Y)"
-                    print(f"[YAKLAŞMA] {phase}, LockedX={object_x:.0f}, BoxH={box_height}px (Max={max_box_height}, {shrink_status}), Dist={range_front_value:.2f}m, İleri={forward_desired:.2f}, Z_diff={height_diff_desired:.3f}")
+                    phase = "YAKIN" if is_close_phase else "UZAK"
+                    raw_x = list(ma_x)[-1] if len(ma_x) > 0 else 0
+                    print(f"[YAKLAŞMA] {phase}, RawX={raw_x:.0f}, MA_X={smoothed_x:.0f}, BoxH={box_height:.0f}px (Max={max_box_height:.0f}), İleri={forward_desired:.2f}")
             else:
                 # Hedef kaybedildi
                 print("=== HEDEF KAYBEDİLDİ - GRUP ARAMAYA GERİ DÖN ===")
                 mission_state = "SEARCH_GROUP"
                 mission_timer = 0
-                max_box_height = 0  # Reset
+                max_box_height = 0
+                ma_x.clear()  # Moving Average sıfırla
+                ma_box_height.clear()
 
         # Duvar takibi yönü seç
         # Sol yön seçersen, sağ mesafe değerini kullan
