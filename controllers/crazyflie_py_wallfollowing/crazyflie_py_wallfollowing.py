@@ -214,8 +214,10 @@ if __name__ == '__main__':
     # MOVING AVERAGE FİLTRESİ - Target jumping'i önlemek için
     MA_X_LEN = 5  # X pozisyonu için 5 örnek
     MA_Z_LEN = 5  # Mesafe/BoxHeight için 5 örnek
+    MA_DIST_LEN = 5  # Distanz sensörü için 5 örnek
     ma_x = collections.deque(maxlen=MA_X_LEN)  # X pozisyonu Moving Average
     ma_box_height = collections.deque(maxlen=MA_Z_LEN)  # Box yüksekliği Moving Average
+    ma_distance = collections.deque(maxlen=MA_DIST_LEN)  # Distanz sensörü Moving Average
 
     print("\n")
 
@@ -377,6 +379,7 @@ if __name__ == '__main__':
                 # Moving Average'ı sıfırla ve ilk değeri ekle
                 ma_x.clear()
                 ma_box_height.clear()
+                ma_distance.clear()  # Distanz MA da sıfırla
                 ma_x.append(target_info['x'])
                 box_h = target_info['box'][3] - target_info['box'][1]
                 ma_box_height.append(box_h)
@@ -389,7 +392,7 @@ if __name__ == '__main__':
                     mission_timer = 0
 
         elif mission_state == "APPROACH":
-            # YAKLAŞMA: Kilitli hedefe uç (MOVING AVERAGE ile)
+            # YAKLAŞMA: Kilitli hedefe uç (MOVING AVERAGE + LIDAR_ON_TARGET ile)
             if locked_target is not None:
                 # Yeni algılama yap
                 current_target = detect_object(camera_data, camera.getWidth(), camera.getHeight(), yolo_model, mode='select')
@@ -408,14 +411,14 @@ if __name__ == '__main__':
                 # MOVING AVERAGE hesapla - YUMUŞATILMIŞ değerler
                 if len(ma_x) > 0:
                     smoothed_x = sum(ma_x) / len(ma_x)
-                    locked_target['x'] = smoothed_x  # Yumuşatılmış X kullan
+                    locked_target['x'] = smoothed_x
                 else:
                     smoothed_x = locked_target['x']
 
                 if len(ma_box_height) > 0:
                     smoothed_box_height = sum(ma_box_height) / len(ma_box_height)
                 else:
-                    smoothed_box_height = 20  # Varsayılan
+                    smoothed_box_height = 20
 
                 object_x = locked_target['x']
                 object_y = locked_target['y']
@@ -425,6 +428,22 @@ if __name__ == '__main__':
                 center_y = camera.getHeight() / 2
                 error_x = object_x - center_x
                 error_y = object_y - center_y
+
+                # ===== LIDAR_ON_TARGET CHECK =====
+                # Bildmitte (center_x, center_y) bounding box içinde mi?
+                # Sadece o zaman distanz sensörü güvenilir!
+                box_x1, box_y1, box_x2, box_y2 = target_box
+                lidar_on_target = (box_x1 < center_x < box_x2) and (box_y1 < center_y < box_y2)
+
+                # Eğer lidar hedefe bakıyorsa, mesafeyi MA'ya ekle
+                if lidar_on_target and range_front_value < 2.0 and range_front_value > 0.1:
+                    ma_distance.append(range_front_value)
+
+                # Distanz için YUMUŞATILMIŞ değer
+                if len(ma_distance) > 0:
+                    smoothed_distance = sum(ma_distance) / len(ma_distance)
+                else:
+                    smoothed_distance = 2.0  # Varsayılan (uzak)
 
                 # Hedefe dön (Yaw) - YUMUŞATILMIŞ X ile
                 yaw_desired = -0.004 * error_x
@@ -450,45 +469,41 @@ if __name__ == '__main__':
                         height_diff_desired = max(-0.08, min(0.08, height_diff_desired))
 
                 # --- İLERİ HAREKET ---
-                if abs(error_x) < 80:
-                    if is_close_phase:
-                        # YAKIN FAZ: Distanz sensörü kullan
-                        if range_front_value < 2.0 and range_front_value > 0.1:
-                            if range_front_value > 0.35:
-                                forward_desired = 0.10
-                            elif range_front_value > 0.25:
-                                forward_desired = 0.05
-                            else:
-                                forward_desired = 0
-                                print(f"=== HEDEFE ULAŞILDI! Distanz={range_front_value:.2f}m ===")
+                if abs(error_x) < 80:  # X ekseninde merkezlenmişse
+                    if is_close_phase and lidar_on_target and len(ma_distance) >= 3:
+                        # YAKIN FAZ + LiDAR hedefe bakıyor → Distanz sensörü kullan
+                        if smoothed_distance > 0.35:
+                            forward_desired = 0.10
+                        elif smoothed_distance > 0.25:
+                            forward_desired = 0.05
                         else:
-                            if is_shrinking:
-                                forward_desired = 0
-                                print(f"=== HEDEFE ULAŞILDI! BoxH={box_height:.0f}px schrumpft (Max={max_box_height:.0f}px) ===")
-                            else:
-                                forward_desired = 0.10
+                            # 25cm'ye ulaştık → DUR
+                            forward_desired = 0
+                            print(f"=== HEDEFE ULAŞILDI! MA_Dist={smoothed_distance:.2f}m (LiDAR on target) ===")
                     else:
-                        # UZAK FAZ
+                        # LiDAR hedefe bakmıyor veya uzak faz → Box boyutunu kullan
                         if is_shrinking:
                             forward_desired = 0
                             print(f"=== HEDEFE ULAŞILDI! BoxH={box_height:.0f}px schrumpft (Max={max_box_height:.0f}px) ===")
                         else:
-                            forward_desired = 0.15
+                            forward_desired = 0.15 if not is_close_phase else 0.10
 
                 # Her 10. frame'de log
                 if int(mission_timer * 32) % 10 == 0:
                     shrink_status = "SCHRUMPFT!" if is_shrinking else "wächst"
                     phase = "YAKIN" if is_close_phase else "UZAK"
+                    lidar_status = "ON_TARGET" if lidar_on_target else "OFF_TARGET"
                     raw_x = list(ma_x)[-1] if len(ma_x) > 0 else 0
-                    print(f"[YAKLAŞMA] {phase}, RawX={raw_x:.0f}, MA_X={smoothed_x:.0f}, BoxH={box_height:.0f}px (Max={max_box_height:.0f}), İleri={forward_desired:.2f}")
+                    print(f"[YAKLAŞMA] {phase}, RawX={raw_x:.0f}, MA_X={smoothed_x:.0f}, BoxH={box_height:.0f}px, LiDAR={lidar_status}, MA_Dist={smoothed_distance:.2f}m, İleri={forward_desired:.2f}")
             else:
                 # Hedef kaybedildi
                 print("=== HEDEF KAYBEDİLDİ - GRUP ARAMAYA GERİ DÖN ===")
                 mission_state = "SEARCH_GROUP"
                 mission_timer = 0
                 max_box_height = 0
-                ma_x.clear()  # Moving Average sıfırla
+                ma_x.clear()
                 ma_box_height.clear()
+                ma_distance.clear()
 
         # Duvar takibi yönü seç
         # Sol yön seçersen, sağ mesafe değerini kullan
