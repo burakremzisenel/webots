@@ -56,8 +56,9 @@ def detect_object(image_data, width, height, model, mode='group'):
 
     for result in results:
         for box in result.boxes:
-            # Sadece şişe, bardak, vazo
-            if int(box.cls) in [39, 41, 75]:
+            # Araba, şişe, bardak, vazo (COCO dataset classes)
+            # 2=car, 39=bottle, 41=cup, 75=vase
+            if int(box.cls) in [2, 39, 41, 75]:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cx = float(box.xywh[0][0])
                 cy = float(box.xywh[0][1])
@@ -146,37 +147,105 @@ if __name__ == '__main__':
     robot = Robot()
     timestep = int(robot.getBasicTimeStep())
 
-    # Motorları başlat
-    m1_motor = robot.getDevice("m1_motor")
-    m1_motor.setPosition(float('inf'))
-    m1_motor.setVelocity(-1)
-    m2_motor = robot.getDevice("m2_motor")
-    m2_motor.setPosition(float('inf'))
-    m2_motor.setVelocity(1)
-    m3_motor = robot.getDevice("m3_motor")
-    m3_motor.setPosition(float('inf'))
-    m3_motor.setVelocity(-1)
-    m4_motor = robot.getDevice("m4_motor")
-    m4_motor.setPosition(float('inf'))
-    m4_motor.setVelocity(1)
+    # ===== DRONE TİPİ ALGILAMA =====
+    # Crazyflie mi yoksa Mavic 2 Pro mu kullanılıyor?
+    drone_type = "UNKNOWN"
 
-    # Sensörleri başlat
-    imu = robot.getDevice("inertial_unit")
+    # Crazyflie kontrolü (m1_motor varsa Crazyflie)
+    test_motor = robot.getDevice("m1_motor")
+    if test_motor is not None:
+        drone_type = "CRAZYFLIE"
+        print("=== DRONE TİPİ: CRAZYFLIE ===")
+
+        # Crazyflie Motorları
+        m1_motor = robot.getDevice("m1_motor")
+        m1_motor.setPosition(float('inf'))
+        m1_motor.setVelocity(-1)
+        m2_motor = robot.getDevice("m2_motor")
+        m2_motor.setPosition(float('inf'))
+        m2_motor.setVelocity(1)
+        m3_motor = robot.getDevice("m3_motor")
+        m3_motor.setPosition(float('inf'))
+        m3_motor.setVelocity(-1)
+        m4_motor = robot.getDevice("m4_motor")
+        m4_motor.setPosition(float('inf'))
+        m4_motor.setVelocity(1)
+        motors = [m1_motor, m2_motor, m3_motor, m4_motor]
+
+        # Crazyflie Sensörleri
+        imu = robot.getDevice("inertial_unit")
+        gps = robot.getDevice("gps")
+        gyro = robot.getDevice("gyro")
+
+        # Crazyflie Range Sensörleri
+        range_front = robot.getDevice("range_front")
+        range_left = robot.getDevice("range_left")
+        range_back = robot.getDevice("range_back")
+        range_right = robot.getDevice("range_right")
+        has_range_sensors = True
+
+    else:
+        # Mavic 2 Pro kontrolü
+        test_motor = robot.getDevice("front left propeller")
+        if test_motor is not None:
+            drone_type = "MAVIC2PRO"
+            print("=== DRONE TİPİ: MAVIC 2 PRO ===")
+
+            # Mavic 2 Pro Motorları
+            m1_motor = robot.getDevice("front left propeller")
+            m1_motor.setPosition(float('inf'))
+            m1_motor.setVelocity(1)
+            m2_motor = robot.getDevice("front right propeller")
+            m2_motor.setPosition(float('inf'))
+            m2_motor.setVelocity(-1)
+            m3_motor = robot.getDevice("rear left propeller")
+            m3_motor.setPosition(float('inf'))
+            m3_motor.setVelocity(-1)
+            m4_motor = robot.getDevice("rear right propeller")
+            m4_motor.setPosition(float('inf'))
+            m4_motor.setVelocity(1)
+            motors = [m1_motor, m2_motor, m3_motor, m4_motor]
+
+            # Mavic 2 Pro Sensörleri (BÜYÜK HARF!)
+            imu = robot.getDevice("inertial unit")
+            gps = robot.getDevice("gps")
+            gyro = robot.getDevice("gyro")
+
+            # Mavic 2 Pro Range Sensörü (cameraSlot'a eklendiyse)
+            range_front = robot.getDevice("range_front")
+            range_left = None
+            range_back = None
+            range_right = None
+            if range_front is not None:
+                has_range_sensors = True
+                print("[BİLGİ] Mavic 2 Pro'da range_front sensörü bulundu!")
+            else:
+                has_range_sensors = False
+                print("[UYARI] Mavic 2 Pro'da range sensörü yok! Box-tabanlı mesafe kullanılacak.")
+
+        else:
+            print("=== HATA: Bilinmeyen drone tipi! ===")
+            exit(1)
+
+    # Sensörleri etkinleştir
     imu.enable(timestep)
-    gps = robot.getDevice("gps")
     gps.enable(timestep)
-    gyro = robot.getDevice("gyro")
     gyro.enable(timestep)
+
+    # Kamera (her iki drone için aynı)
     camera = robot.getDevice("camera")
     camera.enable(timestep)
-    range_front = robot.getDevice("range_front")
-    range_front.enable(timestep)
-    range_left = robot.getDevice("range_left")
-    range_left.enable(timestep)
-    range_back = robot.getDevice("range_back")
-    range_back.enable(timestep)
-    range_right = robot.getDevice("range_right")
-    range_right.enable(timestep)
+
+    # Range sensörlerini etkinleştir (varsa)
+    if has_range_sensors:
+        if range_front is not None:
+            range_front.enable(timestep)
+        if range_left is not None:
+            range_left.enable(timestep)
+        if range_back is not None:
+            range_back.enable(timestep)
+        if range_right is not None:
+            range_right.enable(timestep)
 
     # Klavye
     keyboard = Keyboard()
@@ -305,9 +374,22 @@ if __name__ == '__main__':
 
         # --- YENİ GRUP BAZLI GÖREV MANTIĞI ---
         camera_data = camera.getImage()
-        range_front_value = range_front.getValue() / 1000
-        range_right_value = range_right.getValue() / 1000
-        range_left_value = range_left.getValue() / 1000
+
+        # Range sensör değerlerini oku (varsa)
+        if has_range_sensors and range_front is not None:
+            range_front_value = range_front.getValue() / 1000
+        else:
+            range_front_value = 2.0  # Max range (uzak varsay)
+
+        if has_range_sensors and range_right is not None:
+            range_right_value = range_right.getValue() / 1000
+        else:
+            range_right_value = 2.0
+
+        if has_range_sensors and range_left is not None:
+            range_left_value = range_left.getValue() / 1000
+        else:
+            range_left_value = 2.0
 
         if mission_state == "TAKEOFF":
             # 2 saniye yüksel
@@ -435,8 +517,8 @@ if __name__ == '__main__':
                 box_x1, box_y1, box_x2, box_y2 = target_box
                 lidar_on_target = (box_x1 < center_x < box_x2) and (box_y1 < center_y < box_y2)
 
-                # Eğer lidar hedefe bakıyorsa, mesafeyi MA'ya ekle
-                if lidar_on_target and range_front_value < 2.0 and range_front_value > 0.1:
+                # Eğer range sensörü varsa VE lidar hedefe bakıyorsa, mesafeyi MA'ya ekle
+                if has_range_sensors and lidar_on_target and range_front_value < 2.0 and range_front_value > 0.1:
                     ma_distance.append(range_front_value)
 
                 # Distanz için YUMUŞATILMIŞ değer
@@ -492,9 +574,14 @@ if __name__ == '__main__':
                 if int(mission_timer * 32) % 10 == 0:
                     shrink_status = "SCHRUMPFT!" if is_shrinking else "wächst"
                     phase = "YAKIN" if is_close_phase else "UZAK"
-                    lidar_status = "ON_TARGET" if lidar_on_target else "OFF_TARGET"
+                    if has_range_sensors:
+                        lidar_status = "ON_TARGET" if lidar_on_target else "OFF_TARGET"
+                        dist_info = f"MA_Dist={smoothed_distance:.2f}m"
+                    else:
+                        lidar_status = "NO_SENSOR"
+                        dist_info = "BoxOnly"
                     raw_x = list(ma_x)[-1] if len(ma_x) > 0 else 0
-                    print(f"[YAKLAŞMA] {phase}, RawX={raw_x:.0f}, MA_X={smoothed_x:.0f}, BoxH={box_height:.0f}px, LiDAR={lidar_status}, MA_Dist={smoothed_distance:.2f}m, İleri={forward_desired:.2f}")
+                    print(f"[YAKLAŞMA] {phase}, RawX={raw_x:.0f}, MA_X={smoothed_x:.0f}, BoxH={box_height:.0f}px, LiDAR={lidar_status}, {dist_info}, İleri={forward_desired:.2f}")
             else:
                 # Hedef kaybedildi
                 print("=== HEDEF KAYBEDİLDİ - GRUP ARAMAYA GERİ DÖN ===")
@@ -520,16 +607,67 @@ if __name__ == '__main__':
             forward_desired = cmd_vel_x
             yaw_desired = cmd_ang_w
 
-        # Sabit yükseklikli PID hız kontrolcüsü
-        motor_power = PID_crazyflie.pid(dt, forward_desired, sideways_desired,
-                                        yaw_desired, height_desired,
-                                        roll, pitch, yaw_rate,
-                                        altitude, v_x, v_y)
+        # Motor hızlarını ayarla (drone tipine göre farklı kontrol)
+        if drone_type == "CRAZYFLIE":
+            # Crazyflie PID kontrolcüsü
+            motor_power = PID_crazyflie.pid(dt, forward_desired, sideways_desired,
+                                            yaw_desired, height_desired,
+                                            roll, pitch, yaw_rate,
+                                            altitude, v_x, v_y)
+            m1_motor.setVelocity(-motor_power[0])
+            m2_motor.setVelocity(motor_power[1])
+            m3_motor.setVelocity(-motor_power[2])
+            m4_motor.setVelocity(motor_power[3])
 
-        m1_motor.setVelocity(-motor_power[0])
-        m2_motor.setVelocity(motor_power[1])
-        m3_motor.setVelocity(-motor_power[2])
-        m4_motor.setVelocity(motor_power[3])
+        elif drone_type == "MAVIC2PRO":
+            # ===== MAVIC 2 PRO ÖZEL KONTROL SİSTEMİ =====
+            # Webots örnek kontrolcüsünden alındı (mavic2pro.c)
+
+            # Sabitler (ampirik olarak bulunmuş)
+            K_VERTICAL_THRUST = 68.5  # Bu thrust ile drone kalkar
+            K_VERTICAL_OFFSET = 0.6   # Hedef irtifa ofseti
+            K_VERTICAL_P = 3.0        # Dikey PID P sabiti
+            K_ROLL_P = 50.0           # Roll PID P sabiti
+            K_PITCH_P = 30.0          # Pitch PID P sabiti
+
+            # Gyro değerlerini al (roll/pitch velocity)
+            roll_velocity = gyro.getValues()[0]
+            pitch_velocity = gyro.getValues()[1]
+
+            # Disturbance değerlerini hesapla (desired değerlerden)
+            # forward_desired -> pitch_disturbance (negatif = ileri)
+            # sideways_desired -> roll_disturbance (pozitif = sol)
+            # yaw_desired -> yaw_disturbance
+            # Webots örneğinde keyboard ile -2.0 kullanılıyor
+            # forward_desired=0.15 için -2.0 civarı çıkması lazım -> 0.15 * 13 = ~2
+            pitch_disturbance = -forward_desired * 13.0  # Ölçek faktörü artırıldı
+            roll_disturbance = sideways_desired * 2.0
+            yaw_disturbance = yaw_desired * 1.3
+
+            # Clamp fonksiyonu
+            def clamp(value, low, high):
+                return max(low, min(high, value))
+
+            # Girişleri hesapla
+            roll_input = K_ROLL_P * clamp(roll, -1, 1) + roll_velocity + roll_disturbance
+            pitch_input = K_PITCH_P * clamp(pitch, -1, 1) + pitch_velocity + pitch_disturbance
+            yaw_input = yaw_disturbance
+
+            # Dikey kontrol (kübik fonksiyon)
+            clamped_diff_alt = clamp(height_desired - altitude + K_VERTICAL_OFFSET, -1, 1)
+            vertical_input = K_VERTICAL_P * (clamped_diff_alt ** 3)
+
+            # Motor karışımı (Webots Mavic 2 Pro formülü)
+            front_left = K_VERTICAL_THRUST + vertical_input - roll_input + pitch_input - yaw_input
+            front_right = K_VERTICAL_THRUST + vertical_input + roll_input + pitch_input + yaw_input
+            rear_left = K_VERTICAL_THRUST + vertical_input - roll_input - pitch_input + yaw_input
+            rear_right = K_VERTICAL_THRUST + vertical_input + roll_input - pitch_input - yaw_input
+
+            # Motor hızlarını ayarla (işaretler Webots örneğinden)
+            m1_motor.setVelocity(front_left)       # front left: pozitif
+            m2_motor.setVelocity(-front_right)     # front right: negatif
+            m3_motor.setVelocity(-rear_left)       # rear left: negatif
+            m4_motor.setVelocity(rear_right)       # rear right: pozitif
 
         past_time = robot.getTime()
         past_x_global = x_global
