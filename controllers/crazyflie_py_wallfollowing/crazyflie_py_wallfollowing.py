@@ -29,7 +29,135 @@ import cv2
 from ultralytics import YOLO
 import collections  # Moving Average için
 
-from math import cos, sin
+from math import cos, sin, sqrt, atan2
+
+# =====================================================
+# KALMAN FİLTER - Pozisyon ve Hız Tahmini için
+# OcSort/DeepOcSort implementasyonundan adapte edildi
+# =====================================================
+class SimpleKalmanFilter:
+    """
+    2D Kalman Filter for tracking target position and velocity.
+    State: [x, y, vx, vy] - position and velocity
+    Measurement: [x, y] - only position is observed
+    """
+    def __init__(self, initial_x=0, initial_y=0):
+        # State: [x, y, vx, vy]
+        self.x = np.array([[initial_x], [initial_y], [0.0], [0.0]])
+
+        # State transition matrix (constant velocity model)
+        self.F = np.array([
+            [1, 0, 1, 0],  # x = x + vx
+            [0, 1, 0, 1],  # y = y + vy
+            [0, 0, 1, 0],  # vx = vx
+            [0, 0, 0, 1],  # vy = vy
+        ], dtype=float)
+
+        # Measurement matrix (only observe position)
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], dtype=float)
+
+        # Initial covariance (high uncertainty)
+        self.P = np.eye(4) * 100
+
+        # Process noise
+        self.Q = np.diag([1.0, 1.0, 0.5, 0.5])
+
+        # Measurement noise
+        self.R = np.diag([5.0, 5.0])
+
+        # Track state
+        self.hits = 0
+        self.time_since_update = 0
+        self.age = 0
+
+    def predict(self):
+        """Predict next state based on constant velocity model."""
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        self.age += 1
+        self.time_since_update += 1
+        return self.x[:2].flatten()  # Return predicted [x, y]
+
+    def update(self, z):
+        """Update state with measurement z = [x, y]."""
+        z = np.array([[z[0]], [z[1]]])
+
+        # Innovation
+        y = z - self.H @ self.x
+
+        # Innovation covariance
+        S = self.H @ self.P @ self.H.T + self.R
+
+        # Kalman gain
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        # Update state
+        self.x = self.x + K @ y
+
+        # Update covariance
+        I = np.eye(4)
+        self.P = (I - K @ self.H) @ self.P
+
+        self.hits += 1
+        self.time_since_update = 0
+
+        return self.x[:2].flatten()  # Return updated [x, y]
+
+    def get_velocity(self):
+        """Get current velocity estimate [vx, vy]."""
+        return self.x[2:].flatten()
+
+    def get_position(self):
+        """Get current position estimate [x, y]."""
+        return self.x[:2].flatten()
+
+    def get_speed(self):
+        """Get speed magnitude."""
+        vx, vy = self.get_velocity()
+        return sqrt(vx**2 + vy**2)
+
+    def get_direction(self):
+        """Get velocity direction in radians."""
+        vx, vy = self.get_velocity()
+        return atan2(vy, vx)
+
+
+# =====================================================
+# TRACK STATE - Hedef durumu yönetimi
+# =====================================================
+class TrackState:
+    INITIALIZING = 0  # İlk birkaç frame (henüz onaylanmamış)
+    CONFIRMED = 1     # Onaylanmış hedef
+    LOST = 2          # Hedef kaybedildi (aranıyor)
+
+
+def velocity_direction_consistency(current_pos, predicted_pos, last_pos):
+    """
+    Check if the detection is consistent with predicted velocity direction.
+    Returns a score between 0 and 1 (1 = perfectly consistent).
+    """
+    if last_pos is None:
+        return 1.0
+
+    # Predicted direction
+    pred_dx = predicted_pos[0] - last_pos[0]
+    pred_dy = predicted_pos[1] - last_pos[1]
+    pred_norm = sqrt(pred_dx**2 + pred_dy**2) + 1e-6
+
+    # Actual direction
+    act_dx = current_pos[0] - last_pos[0]
+    act_dy = current_pos[1] - last_pos[1]
+    act_norm = sqrt(act_dx**2 + act_dy**2) + 1e-6
+
+    # Cosine similarity
+    cos_sim = (pred_dx * act_dx + pred_dy * act_dy) / (pred_norm * act_norm)
+
+    # Convert to score (0-1)
+    score = (cos_sim + 1) / 2
+    return score
 
 from pid_controller import pid_velocity_fixed_height_controller
 from wall_following import WallFollowing
@@ -280,6 +408,20 @@ if __name__ == '__main__':
     group_aligned = False  # Grup merkezine hizalandık mı?
     max_box_height = 0  # Maksimum box yüksekliği (schrumpfeni tespit için)
 
+    # ===== KALMAN FILTER & TRACK STATE (BoxMOT/OcSort'tan) =====
+    target_kalman = None  # Hedef için Kalman filter
+    track_state = TrackState.INITIALIZING  # Track durumu
+    MIN_HITS_TO_CONFIRM = 3  # Onay için gereken ardışık algılama
+    MAX_AGE_LOST = 15  # Kaybedilmeden önce maksimum frame sayısı
+    last_target_pos = None  # Son hedef pozisyonu (velocity direction için)
+
+    # DEAD ZONE - Küçük hataları yoksay (jitter'ı önler)
+    DEAD_ZONE_X = 15  # piksel - X ekseninde dead zone
+    DEAD_ZONE_Y = 10  # piksel - Y ekseninde dead zone
+
+    # VELOCITY DIRECTION CONSISTENCY
+    MIN_VELOCITY_CONSISTENCY = 0.3  # Minimum tutarlılık skoru (0-1)
+
     # MOVING AVERAGE FİLTRESİ - Target jumping'i önlemek için
     MA_X_LEN = 5  # X pozisyonu için 5 örnek
     MA_Z_LEN = 5  # Mesafe/BoxHeight için 5 örnek
@@ -458,14 +600,20 @@ if __name__ == '__main__':
                 print(f"=== KIRMIZI HEDEF SEÇİLDİ X={target_info['x']:.0f}, Box={target_info['box']}, Mesafe={range_front_value:.2f}m - YAKLAŞMAYA BAŞLA ===")
                 mission_state = "APPROACH"
                 mission_timer = 0
+
+                # ===== KALMAN FILTER BAŞLAT =====
+                target_kalman = SimpleKalmanFilter(initial_x=target_info['x'], initial_y=target_info['y'])
+                track_state = TrackState.INITIALIZING
+                last_target_pos = (target_info['x'], target_info['y'])
+
                 # Moving Average'ı sıfırla ve ilk değeri ekle
                 ma_x.clear()
                 ma_box_height.clear()
-                ma_distance.clear()  # Distanz MA da sıfırla
+                ma_distance.clear()
                 ma_x.append(target_info['x'])
                 box_h = target_info['box'][3] - target_info['box'][1]
                 ma_box_height.append(box_h)
-                max_box_height = box_h  # Max box'ı da sıfırla
+                max_box_height = box_h
             else:
                 # Kırmızı nesne yok, gruba geri dön
                 if mission_timer > 3.0:
@@ -474,26 +622,80 @@ if __name__ == '__main__':
                     mission_timer = 0
 
         elif mission_state == "APPROACH":
-            # YAKLAŞMA: Kilitli hedefe uç (MOVING AVERAGE + LIDAR_ON_TARGET ile)
-            if locked_target is not None:
+            # YAKLAŞMA: Kilitli hedefe uç (KALMAN + VELOCITY CONSISTENCY + DEAD ZONE)
+            if locked_target is not None and target_kalman is not None:
+                # ===== KALMAN PREDICT (önce tahmin yap) =====
+                predicted_pos = target_kalman.predict()
+
                 # Yeni algılama yap
                 current_target = detect_object(camera_data, camera.getWidth(), camera.getHeight(), yolo_model, mode='select')
 
+                detection_valid = False
                 if current_target is not None:
-                    # MOVING AVERAGE: Ham değeri ekle (sıçramalar dahil!)
-                    ma_x.append(current_target['x'])
-                    new_box = current_target['box']
-                    new_box_height = new_box[3] - new_box[1]
-                    ma_box_height.append(new_box_height)
+                    current_pos = (current_target['x'], current_target['y'])
 
-                    # Box'ı güncelle (her zaman en son box kullan)
-                    locked_target['box'] = new_box
-                    locked_target['y'] = current_target['y']
+                    # ===== VELOCITY DIRECTION CONSISTENCY =====
+                    # Algılanan pozisyon, tahmin edilen yönle tutarlı mı?
+                    vdc_score = velocity_direction_consistency(current_pos, predicted_pos, last_target_pos)
 
-                # MOVING AVERAGE hesapla - YUMUŞATILMIŞ değerler
+                    # Kalman hızı yeterince büyükse VDC kontrolü yap
+                    if target_kalman.get_speed() > 2.0:
+                        if vdc_score < MIN_VELOCITY_CONSISTENCY:
+                            # Tutarsız algılama - muhtemelen yanlış hedef
+                            print(f"[UYARI] VDC düşük: {vdc_score:.2f} - algılama reddedildi")
+                            detection_valid = False
+                        else:
+                            detection_valid = True
+                    else:
+                        # Düşük hızda VDC kontrolü gevşet
+                        detection_valid = True
+
+                    if detection_valid:
+                        # ===== KALMAN UPDATE =====
+                        filtered_pos = target_kalman.update(current_pos)
+                        last_target_pos = current_pos
+
+                        # Moving Average'a da ekle
+                        ma_x.append(filtered_pos[0])
+                        new_box = current_target['box']
+                        new_box_height = new_box[3] - new_box[1]
+                        ma_box_height.append(new_box_height)
+
+                        # Box'ı güncelle
+                        locked_target['box'] = new_box
+                        locked_target['y'] = filtered_pos[1]
+                        locked_target['x'] = filtered_pos[0]
+
+                        # Track state güncelle
+                        if track_state == TrackState.INITIALIZING:
+                            if target_kalman.hits >= MIN_HITS_TO_CONFIRM:
+                                track_state = TrackState.CONFIRMED
+                                print(f"=== HEDEF ONAYLANDI (hits={target_kalman.hits}) ===")
+
+                # Algılama yoksa veya geçersizse, Kalman tahmini kullan
+                if not detection_valid:
+                    # Tahmini pozisyonu kullan
+                    locked_target['x'] = predicted_pos[0]
+                    locked_target['y'] = predicted_pos[1]
+
+                    # Track durumunu kontrol et
+                    if target_kalman.time_since_update > MAX_AGE_LOST:
+                        track_state = TrackState.LOST
+                        print(f"=== HEDEF KAYBEDİLDİ (time_since_update={target_kalman.time_since_update}) ===")
+                        mission_state = "SEARCH_GROUP"
+                        mission_timer = 0
+                        target_kalman = None
+                        locked_target = None
+                        last_target_pos = None
+                        ma_x.clear()
+                        ma_box_height.clear()
+                        ma_distance.clear()
+                        max_box_height = 0
+                        continue  # Döngüye devam et
+
+                # MOVING AVERAGE hesapla (Kalman + MA kombinasyonu)
                 if len(ma_x) > 0:
                     smoothed_x = sum(ma_x) / len(ma_x)
-                    locked_target['x'] = smoothed_x
                 else:
                     smoothed_x = locked_target['x']
 
@@ -502,7 +704,7 @@ if __name__ == '__main__':
                 else:
                     smoothed_box_height = 20
 
-                object_x = locked_target['x']
+                object_x = smoothed_x  # Kalman + MA filtrelenmiş
                 object_y = locked_target['y']
                 target_box = locked_target['box']
 
@@ -511,13 +713,17 @@ if __name__ == '__main__':
                 error_x = object_x - center_x
                 error_y = object_y - center_y
 
+                # ===== DEAD ZONE - Küçük hataları yoksay =====
+                if abs(error_x) < DEAD_ZONE_X:
+                    error_x = 0
+                if abs(error_y) < DEAD_ZONE_Y:
+                    error_y = 0
+
                 # ===== LIDAR_ON_TARGET CHECK =====
-                # Bildmitte (center_x, center_y) bounding box içinde mi?
-                # Sadece o zaman distanz sensörü güvenilir!
                 box_x1, box_y1, box_x2, box_y2 = target_box
                 lidar_on_target = (box_x1 < center_x < box_x2) and (box_y1 < center_y < box_y2)
 
-                # Eğer range sensörü varsa VE lidar hedefe bakıyorsa, mesafeyi MA'ya ekle
+                # Eğer range sensörü varsa VE lidar hedefe bakıyorsa
                 if has_range_sensors and lidar_on_target and range_front_value < 2.0 and range_front_value > 0.1:
                     ma_distance.append(range_front_value)
 
@@ -525,11 +731,14 @@ if __name__ == '__main__':
                 if len(ma_distance) > 0:
                     smoothed_distance = sum(ma_distance) / len(ma_distance)
                 else:
-                    smoothed_distance = 2.0  # Varsayılan (uzak)
+                    smoothed_distance = 2.0
 
-                # Hedefe dön (Yaw) - YUMUŞATILMIŞ X ile
-                yaw_desired = -0.004 * error_x
-                yaw_desired = max(-0.5, min(0.5, yaw_desired))
+                # ===== YAW KONTROL (Dead zone uygulanmış) =====
+                if error_x != 0:
+                    yaw_desired = -0.004 * error_x
+                    yaw_desired = max(-0.5, min(0.5, yaw_desired))
+                else:
+                    yaw_desired = 0  # Dead zone içinde - dönme
 
                 # Box yüksekliği - YUMUŞATILMIŞ
                 box_height = smoothed_box_height
@@ -538,50 +747,52 @@ if __name__ == '__main__':
                 if box_height > max_box_height:
                     max_box_height = box_height
 
-                # STOPP LOGIC: Box schrumpft (YUMUŞATILMIŞ değerle)
+                # STOPP LOGIC: Box schrumpft
                 is_shrinking = (max_box_height - box_height) > 10
 
                 # PHASE DETECTION
                 is_close_phase = box_height >= 35
 
                 # --- YÜKSEK SEVİYE KONTROL (Z ekseni) ---
-                if is_close_phase:
-                    if abs(error_y) > 20:
-                        height_diff_desired = -error_y * 0.0002
-                        height_diff_desired = max(-0.08, min(0.08, height_diff_desired))
+                if is_close_phase and error_y != 0:
+                    height_diff_desired = -error_y * 0.0002
+                    height_diff_desired = max(-0.08, min(0.08, height_diff_desired))
 
-                # --- İLERİ HAREKET ---
-                if abs(error_x) < 80:  # X ekseninde merkezlenmişse
+                # --- İLERİ HAREKET (sadece CONFIRMED track için) ---
+                if track_state == TrackState.CONFIRMED and abs(error_x) < 80:
                     if is_close_phase and lidar_on_target and len(ma_distance) >= 3:
-                        # YAKIN FAZ + LiDAR hedefe bakıyor → Distanz sensörü kullan
                         if smoothed_distance > 0.35:
                             forward_desired = 0.10
                         elif smoothed_distance > 0.25:
                             forward_desired = 0.05
                         else:
-                            # 25cm'ye ulaştık → DUR
                             forward_desired = 0
-                            print(f"=== HEDEFE ULAŞILDI! MA_Dist={smoothed_distance:.2f}m (LiDAR on target) ===")
+                            print(f"=== HEDEFE ULAŞILDI! MA_Dist={smoothed_distance:.2f}m ===")
                     else:
-                        # LiDAR hedefe bakmıyor veya uzak faz → Box boyutunu kullan
                         if is_shrinking:
                             forward_desired = 0
-                            print(f"=== HEDEFE ULAŞILDI! BoxH={box_height:.0f}px schrumpft (Max={max_box_height:.0f}px) ===")
+                            print(f"=== HEDEFE ULAŞILDI! BoxH={box_height:.0f}px ===")
                         else:
                             forward_desired = 0.15 if not is_close_phase else 0.10
+                elif track_state == TrackState.INITIALIZING:
+                    # Onay beklerken yavaş ilerle
+                    forward_desired = 0.05
 
                 # Her 10. frame'de log
                 if int(mission_timer * 32) % 10 == 0:
-                    shrink_status = "SCHRUMPFT!" if is_shrinking else "wächst"
                     phase = "YAKIN" if is_close_phase else "UZAK"
                     if has_range_sensors:
-                        lidar_status = "ON_TARGET" if lidar_on_target else "OFF_TARGET"
-                        dist_info = f"MA_Dist={smoothed_distance:.2f}m"
+                        lidar_status = "ON" if lidar_on_target else "OFF"
+                        dist_info = f"Dist={smoothed_distance:.2f}m"
                     else:
-                        lidar_status = "NO_SENSOR"
+                        lidar_status = "NO"
                         dist_info = "BoxOnly"
-                    raw_x = list(ma_x)[-1] if len(ma_x) > 0 else 0
-                    print(f"[YAKLAŞMA] {phase}, RawX={raw_x:.0f}, MA_X={smoothed_x:.0f}, BoxH={box_height:.0f}px, LiDAR={lidar_status}, {dist_info}, İleri={forward_desired:.2f}")
+
+                    # Track state string
+                    state_str = ["INIT", "CONF", "LOST"][track_state]
+                    kf_speed = target_kalman.get_speed() if target_kalman else 0
+
+                    print(f"[{state_str}] {phase}, KF_X={object_x:.0f}, BoxH={box_height:.0f}px, V={kf_speed:.1f}, LiDAR={lidar_status}, {dist_info}, Fwd={forward_desired:.2f}")
             else:
                 # Hedef kaybedildi
                 print("=== HEDEF KAYBEDİLDİ - GRUP ARAMAYA GERİ DÖN ===")
