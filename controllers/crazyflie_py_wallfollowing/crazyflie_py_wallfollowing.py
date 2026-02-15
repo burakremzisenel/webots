@@ -759,24 +759,30 @@ if __name__ == '__main__':
                     height_diff_desired = max(-0.08, min(0.08, height_diff_desired))
 
                 # --- İLERİ HAREKET (sadece CONFIRMED track için) ---
+                # HIZLAR ARTIRILDI - Maksimum performans için
                 if track_state == TrackState.CONFIRMED and abs(error_x) < 80:
                     if is_close_phase and lidar_on_target and len(ma_distance) >= 3:
-                        if smoothed_distance > 0.35:
-                            forward_desired = 0.10
+                        # LiDAR mesafesine göre hız kontrolü
+                        if smoothed_distance > 0.50:
+                            forward_desired = 0.30  # Hızlı yaklaşma
+                        elif smoothed_distance > 0.35:
+                            forward_desired = 0.20  # Orta hız
                         elif smoothed_distance > 0.25:
-                            forward_desired = 0.05
+                            forward_desired = 0.10  # Yavaş
                         else:
                             forward_desired = 0
                             print(f"=== HEDEFE ULAŞILDI! MA_Dist={smoothed_distance:.2f}m ===")
                     else:
+                        # Box boyutuna göre hız kontrolü
                         if is_shrinking:
                             forward_desired = 0
                             print(f"=== HEDEFE ULAŞILDI! BoxH={box_height:.0f}px ===")
                         else:
-                            forward_desired = 0.15 if not is_close_phase else 0.10
+                            # UZAK FAZ: Hızlı, YAKIN FAZ: Orta hız
+                            forward_desired = 0.60 if not is_close_phase else 0.25
                 elif track_state == TrackState.INITIALIZING:
-                    # Onay beklerken yavaş ilerle
-                    forward_desired = 0.05
+                    # Onay beklerken orta hızda ilerle
+                    forward_desired = 0.20
 
                 # Her 10. frame'de log
                 if int(mission_timer * 32) % 10 == 0:
@@ -850,10 +856,10 @@ if __name__ == '__main__':
             # sideways_desired -> roll_disturbance (pozitif = sol)
             # yaw_desired -> yaw_disturbance
             # Webots örneğinde keyboard ile -2.0 kullanılıyor
-            # forward_desired=0.15 için -2.0 civarı çıkması lazım -> 0.15 * 13 = ~2
-            pitch_disturbance = -forward_desired * 13.0  # Ölçek faktörü artırıldı
+            # forward_desired=0.40 için -2.0 civarı → 0.40 * 5 = 2.0
+            pitch_disturbance = -forward_desired * 5.0  # HIZ ARTIRILDI
             roll_disturbance = sideways_desired * 2.0
-            yaw_disturbance = yaw_desired * 1.3
+            yaw_disturbance = yaw_desired * 1.5  # Dönüş de biraz artırıldı
 
             # Clamp fonksiyonu
             def clamp(value, low, high):

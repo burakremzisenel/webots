@@ -25,8 +25,8 @@ WorldInfo {
   }
 }
 Viewpoint {
-  orientation -0.05634066790598576 -0.000934297588763128 0.9984111659170901 2.8915510869901495
-  position 22.069361979493824 0.3496725720117171 8.951803165323364
+  orientation -0.3524172582748358 -0.18147665995136278 0.9180785902976635 3.9805153017782584
+  position 14.276637712762401 44.14303979487909 48.61346579464534
   near 0.2
   follow "Mavic 2 PRO"
   followSmoothness 0.2
@@ -72,7 +72,7 @@ CardboardBox {
   rotation 0 0 1 -1.8325953071795862
 }
 TeslaModel3Simple {
-  translation -21.18 -5.70012 0.31
+  translation -31.07 -9.44012 0.31
   rotation 0 0 1 1.5708
 }
 Pine {
@@ -114,13 +114,6 @@ Mavic2Pro {
       width 400
       height 240
       near 0.2
-    }
-    DistanceSensor {
-      name "range_front"
-      lookupTable [
-        0 0 0
-        2 2000 0
-      ]
     }
   ]
 }
